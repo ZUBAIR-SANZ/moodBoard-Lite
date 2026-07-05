@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 trivy_pr_comment.py
 ───────────────────
@@ -181,7 +182,7 @@ def upsert_pr_comment(repo: str, pr: str, body: str):
     resp.raise_for_status()
 
 
-def post_blocking_review(repo: str, pr: str, sha: str, body: str):
+def post_blocking_review(repo: str, pr: str, sha: str):
     """
     Submit a REQUEST_CHANGES review — this blocks the PR from being merged
     until the review is dismissed or a new APPROVE review is submitted.
@@ -197,9 +198,8 @@ def post_blocking_review(repo: str, pr: str, sha: str, body: str):
         "body":      (
             "🚨 **Trivy found CRITICAL or HIGH vulnerabilities.**\n\n"
             "This review blocks merging. Please resolve the findings listed "
-            "in the PR comment and re-run the scan. Once clean, request a "
-            "dismissal of this review from a repo admin or code owner.\n\n"
-            + body[:500]          # keep review body short
+            "in the PR comment above and re-run the scan. Once clean, request a "
+            "dismissal of this review from a repo admin or code owner."
         ),
     }
     resp = requests.post(url, headers=HEADERS, json=payload)
@@ -259,7 +259,7 @@ def main():
 
     if blocking:
         print(f"[INFO] Submitting blocking REQUEST_CHANGES review...")
-        post_blocking_review(REPO, PR_NUMBER, PR_HEAD_SHA, comment_body)
+        post_blocking_review(REPO, PR_NUMBER, PR_HEAD_SHA)
     else:
         print(f"[INFO] No CRITICAL/HIGH found — dismissing any stale blocking reviews...")
         dismiss_stale_blocking_reviews(REPO, PR_NUMBER)

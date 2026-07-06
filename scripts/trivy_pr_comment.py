@@ -1,15 +1,19 @@
 """
 trivy_pr_comment.py
 ───────────────────
-Parses trivy-report.json, posts a formatted Vulnerability Summary comment
-on the PR, and submits a blocking "REQUEST_CHANGES" review so the PR
-cannot be merged until the review is dismissed or approved.
+Posts Trivy vulnerability results as a RESOLVABLE THREAD on the PR.
 
-Env vars (injected by GitHub Actions):
-  GH_TOKEN       – GITHUB_TOKEN with pull-requests: write
-  REPO           – e.g. "trayalabs1/my-service"
-  PR_NUMBER      – pull request number
-  PR_HEAD_SHA    – HEAD commit SHA of the PR branch
+Flow:
+  1. Trivy scans → JSON
+  2. Script posts a review with a line-level comment thread on the first
+     changed file → creates a resolvable thread in "Files changed" tab
+  3. Branch protection rule "Require conversation resolution" blocks merge
+     until an admin clicks "Resolve conversation"
+  4. On clean scan → bot dismisses the REQUEST_CHANGES review automatically
+
+Merge is blocked by TWO gates:
+  • REQUEST_CHANGES review   → admin must dismiss
+  • Status check exit 1      → auto-clears on clean scan
 """
 
 import json
@@ -19,58 +23,49 @@ import requests
 from datetime import datetime, timezone
 from collections import defaultdict
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 
-TRIVY_REPORT   = "trivy-report.json"
-GH_TOKEN       = os.environ["GH_TOKEN"]
-REPO           = os.environ["REPO"]
-PR_NUMBER      = os.environ["PR_NUMBER"]
-PR_HEAD_SHA    = os.environ["PR_HEAD_SHA"]
+TRIVY_REPORT  = "trivy-report.json"
+GH_TOKEN      = os.environ["GH_TOKEN"]
+REPO          = os.environ["REPO"]
+PR_NUMBER     = os.environ["PR_NUMBER"]
+PR_HEAD_SHA   = os.environ["PR_HEAD_SHA"]
 
-API_BASE       = "https://api.github.com"
-HEADERS        = {
+API_BASE      = "https://api.github.com"
+HEADERS       = {
     "Authorization": f"Bearer {GH_TOKEN}",
-    "Accept": "application/vnd.github+json",
+    "Accept":        "application/vnd.github+json",
     "X-GitHub-Api-Version": "2022-11-28",
 }
 
-SEVERITY_ORDER  = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]
-SEVERITY_EMOJI  = {
+SEVERITY_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]
+SEVERITY_EMOJI = {
     "CRITICAL": "🔴",
     "HIGH":     "🟠",
     "MEDIUM":   "🟡",
     "LOW":      "🔵",
     "UNKNOWN":  "⚪",
 }
-SEVERITY_THRESHOLD = {   # counts that trigger REQUEST_CHANGES
-    "CRITICAL": 0,       # any CRITICAL → block
-    "HIGH":     0,       # any HIGH     → block
-    "MEDIUM":   sys.maxsize,   # MEDIUM/LOW → informational only
-    "LOW":      sys.maxsize,
-}
+BLOCK_ON = {"CRITICAL", "HIGH"}
 
-# ── Parse Trivy JSON ─────────────────────────────────────────────────────────
+# ── Parse Trivy JSON ──────────────────────────────────────────────────────────
 
-def parse_trivy_report(path: str) -> dict:
-    """Return {severity: count} and a list of top vulnerability details."""
-    counts     = defaultdict(int)
-    top_vulns  = []          # [(severity, pkg, vuln_id, title), ...]
+def parse_trivy_report(path: str):
+    counts    = defaultdict(int)
+    top_vulns = []
 
     if not os.path.exists(path):
-        print(f"[WARN] {path} not found — no vulnerabilities reported.")
-        return counts, top_vulns
+        print(f"[WARN] {path} not found — treating as zero vulnerabilities.")
+        return dict(counts), top_vulns
 
     with open(path) as f:
         report = json.load(f)
 
-    results = report.get("Results", [])
-    for result in results:
+    for result in report.get("Results", []):
         for vuln in result.get("Vulnerabilities") or []:
             sev = vuln.get("Severity", "UNKNOWN").upper()
             counts[sev] += 1
-
-            # Collect top 10 CRITICAL + HIGH for the detail table
-            if sev in ("CRITICAL", "HIGH") and len(top_vulns) < 10:
+            if sev in BLOCK_ON and len(top_vulns) < 10:
                 top_vulns.append({
                     "severity":  sev,
                     "pkg":       vuln.get("PkgName", "—"),
@@ -82,189 +77,293 @@ def parse_trivy_report(path: str) -> dict:
     return dict(counts), top_vulns
 
 
-# ── Build PR comment body ────────────────────────────────────────────────────
+# ── Build comment body ────────────────────────────────────────────────────────
 
-def build_comment(counts: dict, top_vulns: list, blocking: bool) -> str:
+def build_thread_body(counts: dict, top_vulns: list) -> str:
+    """Vulnerability summary posted as a resolvable review thread."""
     scanned_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    total      = sum(counts.get(s, 0) for s in SEVERITY_ORDER)
 
-    total = sum(counts.get(s, 0) for s in SEVERITY_ORDER)
-
-    status_badge = (
-        "🚨 **Action Required — vulnerabilities must be resolved before merging.**"
-        if blocking else
-        "✅ No blocking vulnerabilities found. Review recommended before merge."
-    )
-
-    # Summary table
     rows = ""
     for sev in SEVERITY_ORDER:
         cnt = counts.get(sev, 0)
         if cnt == 0:
             continue
-        emoji = SEVERITY_EMOJI[sev]
-        rows += f"| {emoji} **{sev}** | `{cnt}` |\n"
+        rows += f"| {SEVERITY_EMOJI[sev]} **{sev}** | `{cnt}` |\n"
 
-    summary_table = f"""\
-| Severity | Count |
-|:---------|------:|
-{rows}| **TOTAL** | **`{total}`** |"""
+    summary_table = (
+        "| Severity | Count |\n"
+        "|:---------|------:|\n"
+        f"{rows}"
+        f"| **TOTAL** | **`{total}`** |"
+    )
 
-    # Top vulns detail
     detail_section = ""
     if top_vulns:
         detail_rows = "\n".join(
             f"| {SEVERITY_EMOJI[v['severity']]} {v['severity']} "
-            f"| `{v['vuln_id']}` "
-            f"| `{v['pkg']}` "
-            f"| {v['title']} "
-            f"| {v['fixed_ver']} |"
+            f"| `{v['vuln_id']}` | `{v['pkg']}` | {v['title']} | {v['fixed_ver']} |"
             for v in top_vulns
         )
-        detail_section = f"""
-<details>
-<summary>🔍 Top Critical & High Vulnerabilities (up to 10)</summary>
+        detail_section = (
+            "\n<details>\n"
+            "<summary>🔍 Top Critical & High Vulnerabilities (up to 10)</summary>\n\n"
+            "| Severity | CVE / ID | Package | Title | Fix Version |\n"
+            "|:---------|:---------|:--------|:------|:------------|\n"
+            f"{detail_rows}\n\n"
+            "</details>\n"
+        )
 
-| Severity | CVE / ID | Package | Title | Fix Version |
-|:---------|:---------|:--------|:------|:------------|
-{detail_rows}
-
-</details>
-"""
-
-    comment = f"""## 🛡️ Trivy Vulnerability Scan Report
-
-{status_badge}
-
-### Vulnerability Summary
-
-{summary_table}
-{detail_section}
----
-
-**What to do:**
-- 🔴 **CRITICAL / HIGH** — Must be fixed or have an approved exception before this PR can be merged.
-- 🟡 **MEDIUM / LOW** — Review and remediate where feasible; document accepted risks.
-- Run `trivy fs .` locally to reproduce this scan.
-- Update dependencies, base images, or apply patches to resolve findings.
-
-> 📅 Scanned at **{scanned_at}** on commit `{PR_HEAD_SHA[:8]}` via [Trivy](https://github.com/aquasecurity/trivy).
-> This comment updates automatically on each push to the PR.
-"""
-    return comment
+    return (
+        f"## 🛡️ Trivy Vulnerability Scan — Action Required\n\n"
+        f"🚨 **CRITICAL or HIGH vulnerabilities were found. Merge is BLOCKED.**\n\n"
+        f"### Vulnerability Summary\n\n"
+        f"{summary_table}\n"
+        f"{detail_section}\n"
+        f"---\n\n"
+        f"### 🔧 How to unblock this PR\n\n"
+        f"1. Fix all **CRITICAL** and **HIGH** vulnerabilities above\n"
+        f"2. Push the fix — Trivy will re-scan automatically\n"
+        f"3. Once the scan is clean, an **Admin** must:\n"
+        f"   - Click **Resolve conversation** on this thread ✅\n"
+        f"   - Dismiss the `Changes requested` review\n"
+        f"4. Merge will be enabled after both steps ✅\n\n"
+        f"---\n\n"
+        f"> 📅 Scanned at **{scanned_at}** on commit `{PR_HEAD_SHA[:8]}` "
+        f"via [Trivy](https://github.com/aquasecurity/trivy).\n"
+        f"> ⚠️ Only users with **Admin or Maintain** role can resolve this thread.\n"
+    )
 
 
-# ── GitHub API helpers ───────────────────────────────────────────────────────
+def build_clean_body() -> str:
+    scanned_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return (
+        f"## 🛡️ Trivy Vulnerability Scan Report\n\n"
+        f"✅ **No CRITICAL or HIGH vulnerabilities found — merge is unblocked.**\n\n"
+        f"> 📅 Scanned at **{scanned_at}** on commit `{PR_HEAD_SHA[:8]}`.\n"
+    )
 
-def find_existing_bot_comment(repo: str, pr: str) -> int | None:
-    """Return comment ID of a previous scan comment posted by github-actions[bot]."""
-    url  = f"{API_BASE}/repos/{repo}/issues/{pr}/comments"
+
+# ── GitHub API helpers ────────────────────────────────────────────────────────
+
+def get_pr_files(repo: str, pr: str) -> list:
+    """Return list of files changed in the PR."""
+    url  = f"{API_BASE}/repos/{repo}/pulls/{pr}/files"
     resp = requests.get(url, headers=HEADERS, params={"per_page": 100})
     resp.raise_for_status()
-    for c in resp.json():
-        login = c.get("user", {}).get("login", "")
-        if "github-actions" in login and "Trivy Vulnerability Scan Report" in c.get("body", ""):
-            return c["id"]
+    return resp.json()
+
+
+def get_first_diffable_file(repo: str, pr: str) -> dict | None:
+    """
+    Return the first file that has a patch (diff) — needed to anchor
+    a review line comment which creates a resolvable thread.
+    Prefer package.json / go.mod / requirements.txt as they relate to vulns.
+    Falls back to any file with a patch.
+    """
+    files = get_pr_files(repo, pr)
+    preferred_names = {
+        "package.json", "package-lock.json", "go.mod", "go.sum",
+        "requirements.txt", "Pipfile.lock", "pom.xml", "build.gradle",
+        "Gemfile.lock", "composer.lock", "yarn.lock",
+    }
+
+    # Try preferred dependency files first
+    for f in files:
+        if f.get("patch") and os.path.basename(f["filename"]) in preferred_names:
+            return f
+
+    # Fall back to any file with a diff
+    for f in files:
+        if f.get("patch"):
+            return f
+
     return None
 
 
-def upsert_pr_comment(repo: str, pr: str, body: str):
-    """Update existing bot comment or create a new one."""
-    existing_id = find_existing_bot_comment(repo, pr)
-    if existing_id:
-        url  = f"{API_BASE}/repos/{repo}/issues/comments/{existing_id}"
-        resp = requests.patch(url, headers=HEADERS, json={"body": body})
-        print(f"[INFO] Updated existing comment #{existing_id}")
-    else:
-        url  = f"{API_BASE}/repos/{repo}/issues/{pr}/comments"
-        resp = requests.post(url, headers=HEADERS, json={"body": body})
-        print(f"[INFO] Created new PR comment")
+def find_bot_review(repo: str, pr: str) -> dict | None:
+    """Find the latest REQUEST_CHANGES review from github-actions[bot]."""
+    url  = f"{API_BASE}/repos/{repo}/pulls/{pr}/reviews"
+    resp = requests.get(url, headers=HEADERS, params={"per_page": 100})
     resp.raise_for_status()
+    for review in reversed(resp.json()):
+        login = review.get("user", {}).get("login", "")
+        state = review.get("state", "")
+        if "github-actions" in login and state == "CHANGES_REQUESTED":
+            return review
+    return None
 
 
-def post_blocking_review(repo: str, pr: str, sha: str):
+def find_bot_review_comments(repo: str, pr: str) -> list:
+    """Find all review comments posted by github-actions[bot]."""
+    url  = f"{API_BASE}/repos/{repo}/pulls/{pr}/comments"
+    resp = requests.get(url, headers=HEADERS, params={"per_page": 100})
+    resp.raise_for_status()
+    return [
+        c for c in resp.json()
+        if "github-actions" in c.get("user", {}).get("login", "")
+        and "Trivy Vulnerability Scan" in c.get("body", "")
+    ]
+
+
+def post_review_with_thread(repo: str, pr: str, sha: str, body: str) -> bool:
     """
-    Submit a REQUEST_CHANGES review — this blocks the PR from being merged
-    until the review is dismissed or a new APPROVE review is submitted.
+    Post a REQUEST_CHANGES review with a line-level comment on the first
+    changed file. This creates a resolvable thread in 'Files changed'.
 
-    Note: GitHub does not allow a user to review their own PR.
-    If the workflow token belongs to the PR author, the review call
-    will return 422; we catch that and warn instead of failing.
+    Returns True if review+thread posted, False if fallback needed.
     """
+    target_file = get_first_diffable_file(repo, pr)
+
+    if not target_file:
+        print("[WARN] No diffable file found — cannot create line comment thread.")
+        return False
+
+    filename = target_file["filename"]
+    patch    = target_file.get("patch", "")
+
+    # Find the last added line number in the patch to anchor the comment
+    position = 1   # default: first line of diff
+    for i, line in enumerate(patch.splitlines(), start=1):
+        if line.startswith("+") and not line.startswith("+++"):
+            position = i
+
+    print(f"[INFO] Anchoring thread to: {filename} (diff position {position})")
+
     url     = f"{API_BASE}/repos/{repo}/pulls/{pr}/reviews"
     payload = {
         "commit_id": sha,
         "event":     "REQUEST_CHANGES",
         "body":      (
-            "🚨 **Trivy found CRITICAL or HIGH vulnerabilities.**\n\n"
-            "This review blocks merging. Please resolve the findings listed "
-            "in the PR comment above and re-run the scan. Once clean, request a "
-            "dismissal of this review from a repo admin or code owner."
+            "🚨 **Trivy found CRITICAL or HIGH vulnerabilities.**\n"
+            "See the review thread below. An admin must resolve it before merge."
         ),
+        "comments": [
+            {
+                "path":     filename,
+                "position": position,
+                "body":     body,
+            }
+        ],
+    }
+
+    resp = requests.post(url, headers=HEADERS, json=payload)
+
+    if resp.status_code == 422:
+        print(f"[WARN] 422 from review API — PR author == workflow actor. "
+              f"Falling back to plain review (no thread). Response: {resp.text}")
+        return False
+
+    resp.raise_for_status()
+    review_id = resp.json().get("id")
+    print(f"[INFO] Review with thread posted (id={review_id}) on {filename}.")
+    return True
+
+
+def post_plain_review(repo: str, pr: str, sha: str, body: str):
+    """
+    Fallback: post a REQUEST_CHANGES review without a line comment.
+    Used when the bot cannot review its own PR or no diff is available.
+    """
+    url     = f"{API_BASE}/repos/{repo}/pulls/{pr}/reviews"
+    payload = {
+        "commit_id": sha,
+        "event":     "REQUEST_CHANGES",
+        "body":      body,
     }
     resp = requests.post(url, headers=HEADERS, json=payload)
     if resp.status_code == 422:
-        print(f"[WARN] Cannot submit REQUEST_CHANGES review "
-              f"(likely PR author == workflow actor). "
-              f"Consider adding a dedicated bot account as a required reviewer. "
-              f"Response: {resp.text}")
+        print(f"[WARN] 422 — cannot post review. Merge still blocked via status check.")
     else:
         resp.raise_for_status()
-        print("[INFO] Blocking REQUEST_CHANGES review submitted.")
+        print(f"[INFO] Plain blocking review posted (id={resp.json().get('id')}).")
 
 
-def dismiss_stale_blocking_reviews(repo: str, pr: str):
-    """
-    Dismiss any previously submitted REQUEST_CHANGES reviews from the bot
-    when the current scan is clean, so the PR can be merged.
-    """
-    url  = f"{API_BASE}/repos/{repo}/pulls/{pr}/reviews"
+def update_existing_thread_comment(repo: str, comment_id: int, body: str):
+    """Update the body of an existing review line comment (thread)."""
+    url  = f"{API_BASE}/repos/{repo}/pulls/comments/{comment_id}"
+    resp = requests.patch(url, headers=HEADERS, json={"body": body})
+    resp.raise_for_status()
+    print(f"[INFO] Updated existing thread comment #{comment_id}.")
+
+
+def dismiss_blocking_review(repo: str, pr: str, review_id: int):
+    """Auto-dismiss the bot's REQUEST_CHANGES review when scan is clean."""
+    url  = f"{API_BASE}/repos/{repo}/pulls/{pr}/reviews/{review_id}/dismissals"
+    resp = requests.put(
+        url,
+        headers=HEADERS,
+        json={"message": "✅ Trivy scan is clean — no CRITICAL/HIGH found. Merge unblocked."},
+    )
+    if resp.ok:
+        print(f"[INFO] Dismissed blocking review #{review_id}.")
+    else:
+        print(f"[WARN] Could not auto-dismiss review #{review_id}: {resp.text}\n"
+              f"       Admin must manually dismiss via GitHub UI.")
+
+
+def delete_legacy_plain_comments(repo: str, pr: str):
+    """Remove any old plain issue comments posted by previous script versions."""
+    url  = f"{API_BASE}/repos/{repo}/issues/{pr}/comments"
     resp = requests.get(url, headers=HEADERS, params={"per_page": 100})
     resp.raise_for_status()
-    for review in resp.json():
-        if (review.get("state") == "CHANGES_REQUESTED"
-                and "github-actions" in review.get("user", {}).get("login", "")):
-            review_id = review["id"]
-            dismiss_url = f"{url}/{review_id}/dismissals"
-            d_resp = requests.put(
-                dismiss_url,
+    for c in resp.json():
+        login = c.get("user", {}).get("login", "")
+        if "github-actions" in login and "Trivy Vulnerability Scan" in c.get("body", ""):
+            del_resp = requests.delete(
+                f"{API_BASE}/repos/{repo}/issues/comments/{c['id']}",
                 headers=HEADERS,
-                json={"message": "✅ Trivy scan is now clean — no CRITICAL/HIGH vulnerabilities found."},
             )
-            if d_resp.ok:
-                print(f"[INFO] Dismissed stale blocking review #{review_id}")
-            else:
-                print(f"[WARN] Could not dismiss review #{review_id}: {d_resp.text}")
+            if del_resp.ok:
+                print(f"[INFO] Deleted legacy plain comment #{c['id']}.")
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    print(f"[INFO] Parsing Trivy report: {TRIVY_REPORT}")
+    print(f"[INFO] Parsing {TRIVY_REPORT} ...")
     counts, top_vulns = parse_trivy_report(TRIVY_REPORT)
+    print(f"[INFO] Counts: {dict(counts)}")
 
-    print(f"[INFO] Vulnerability counts: {dict(counts)}")
+    blocking = any(counts.get(sev, 0) > 0 for sev in BLOCK_ON)
 
-    # Determine if we should block the PR
-    blocking = any(
-        counts.get(sev, 0) > threshold
-        for sev, threshold in SEVERITY_THRESHOLD.items()
-        if sev in ("CRITICAL", "HIGH")
-    )
+    # Always clean up old plain comments first
+    delete_legacy_plain_comments(REPO, PR_NUMBER)
 
-    comment_body = build_comment(counts, top_vulns, blocking)
-
-    print(f"[INFO] Posting PR comment on {REPO}#{PR_NUMBER}")
-    upsert_pr_comment(REPO, PR_NUMBER, comment_body)
+    existing_review  = find_bot_review(REPO, PR_NUMBER)
+    existing_threads = find_bot_review_comments(REPO, PR_NUMBER)
 
     if blocking:
-        print(f"[INFO] Submitting blocking REQUEST_CHANGES review...")
-        post_blocking_review(REPO, PR_NUMBER, PR_HEAD_SHA)
-    else:
-        print(f"[INFO] No CRITICAL/HIGH found — dismissing any stale blocking reviews...")
-        dismiss_stale_blocking_reviews(REPO, PR_NUMBER)
+        body = build_thread_body(counts, top_vulns)
 
-    print("[DONE] Vulnerability report complete.")
-    # Exit 0 always — the PR block is enforced via GitHub review, not CI failure
+        if existing_threads:
+            # Update the existing thread comment in-place (no duplicate thread)
+            update_existing_thread_comment(REPO, existing_threads[0]["id"], body)
+            print("[INFO] Updated existing vulnerability thread.")
+        elif existing_review:
+            # Review exists but thread comment was resolved — open a fresh thread
+            print("[INFO] Previous thread was resolved but vulns still present — posting new review thread.")
+            posted = post_review_with_thread(REPO, PR_NUMBER, PR_HEAD_SHA, body)
+            if not posted:
+                post_plain_review(REPO, PR_NUMBER, PR_HEAD_SHA, body)
+        else:
+            # First time — post review + thread
+            posted = post_review_with_thread(REPO, PR_NUMBER, PR_HEAD_SHA, body)
+            if not posted:
+                post_plain_review(REPO, PR_NUMBER, PR_HEAD_SHA, body)
+
+    else:
+        # Scan is clean
+        if existing_review:
+            dismiss_blocking_review(REPO, PR_NUMBER, existing_review["id"])
+        else:
+            # No previous block — post a clean bill comment
+            url  = f"{API_BASE}/repos/{REPO}/issues/{PR_NUMBER}/comments"
+            resp = requests.post(url, headers=HEADERS, json={"body": build_clean_body()})
+            resp.raise_for_status()
+            print("[INFO] Posted clean-scan comment.")
+
+    print("[DONE]")
     sys.exit(0)
 
 

@@ -6,8 +6,8 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write        # post comments + request changes
-  security-events: write      # upload SARIF (optional)
+  pull-requests: write        # post review + dismiss
+  security-events: write
 
 jobs:
   trivy-scan:
@@ -19,8 +19,18 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── 2. Run Trivy fs scan → JSON output ──────────────────────────────
-      - name: Run Trivy vulnerability scanner
+      # ── 2. Run Trivy in Dependabot-equivalent mode ───────────────────────
+      #
+      #   Matches Dependabot scope exactly:
+      #     • scanners: vuln        → only CVEs, no secrets/misconfigs
+      #     • vuln-type: library    → only declared + transitive library deps
+      #                               (no OS packages, same as Dependabot)
+      #     • ignore-unfixed: true  → skip vulns with no available fix
+      #                               (Dependabot only alerts on fixable vulns)
+      #     • skip-dirs             → skip node_modules (Dependabot reads
+      #                               lockfile, not the installed folder)
+      #
+      - name: Run Trivy vulnerability scanner (Dependabot-equivalent)
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: "fs"
@@ -28,25 +38,71 @@ jobs:
           format: "json"
           output: "trivy-report.json"
           severity: "CRITICAL,HIGH,MEDIUM,LOW"
-          exit-code: "0"          # don't fail the step; we handle logic in Python
+          exit-code: "0"
+          scanners: "vuln"
+          vuln-type: "library"
+          ignore-unfixed: "true"
+          skip-dirs: "node_modules,.git"
 
-      # ── 3. Parse report + post PR comment ───────────────────────────────
-      - name: Parse Trivy report and post PR comment
+      # ── 3. Parse report + post resolvable review thread ──────────────────
+      - name: Parse Trivy report and post PR review
+        id: trivy_report
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BOT_REVIEWER: ${{ github.actor }}   # used to avoid self-review error
         run: |
           pip install requests --quiet
           python scripts/trivy_pr_comment.py
 
-      # ── 4. Upload Trivy JSON as artifact (for audit trail) ───────────────
+          # Extract CRITICAL + HIGH counts to drive the status check gate
+          CRITICAL=$(python3 -c "
+          import json
+          r = json.load(open('trivy-report.json'))
+          print(sum(
+            1 for res in r.get('Results', [])
+            for v in (res.get('Vulnerabilities') or [])
+            if v.get('Severity','').upper() == 'CRITICAL'
+          ))
+          " 2>/dev/null || echo "0")
+
+          HIGH=$(python3 -c "
+          import json
+          r = json.load(open('trivy-report.json'))
+          print(sum(
+            1 for res in r.get('Results', [])
+            for v in (res.get('Vulnerabilities') or [])
+            if v.get('Severity','').upper() == 'HIGH'
+          ))
+          " 2>/dev/null || echo "0")
+
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "[INFO] CRITICAL=$CRITICAL HIGH=$HIGH"
+
+      # ── 4. Fail status check when CRITICAL or HIGH found ─────────────────
+      #
+      #   This is the second merge gate (belt + suspenders):
+      #     Gate 1 → REQUEST_CHANGES review  (bot posts, admin dismisses)
+      #     Gate 2 → Status check exit 1     (auto-clears on clean scan)
+      #
+      #   Both must be green for merge to be enabled.
+      #
+      - name: Enforce merge gate on critical/high findings
+        if: >
+          steps.trivy_report.outputs.critical != '0' ||
+          steps.trivy_report.outputs.high != '0'
+        run: |
+          echo "::error::🚨 Merge blocked — CRITICAL=${{ steps.trivy_report.outputs.critical }} HIGH=${{ steps.trivy_report.outputs.high }}"
+          echo "Fix all CRITICAL and HIGH vulnerabilities before this PR can be merged."
+          exit 1
+
+      # ── 5. Upload JSON as artifact for audit trail ───────────────────────
       - name: Upload Trivy report artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trivy-report-${{ github.event.pull_request.number }}
+          name: trivy-report-pr-${{ github.event.pull_request.number }}
           path: trivy-report.json
           retention-days: 30

@@ -6,8 +6,8 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write        # post comments + request changes
-  security-events: write      # upload SARIF (optional)
+  pull-requests: write        # post review + dismiss
+  security-events: write
 
 jobs:
   trivy-scan:
@@ -19,7 +19,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── 2. Run Trivy fs scan → JSON output ──────────────────────────────
+      # ── 2. Run Trivy fs scan → JSON ──────────────────────────────────────
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
@@ -28,25 +28,65 @@ jobs:
           format: "json"
           output: "trivy-report.json"
           severity: "CRITICAL,HIGH,MEDIUM,LOW"
-          exit-code: "0"          # don't fail the step; we handle logic in Python
+          exit-code: "0"          # logic handled in Python
 
-      # ── 3. Parse report + post PR comment ───────────────────────────────
-      - name: Parse Trivy report and post PR comment
+      # ── 3. Parse + post review comment ───────────────────────────────────
+      - name: Parse Trivy report and post PR review
+        id: trivy_report
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BOT_REVIEWER: ${{ github.actor }}   # used to avoid self-review error
         run: |
           pip install requests --quiet
           python scripts/trivy_pr_comment.py
 
-      # ── 4. Upload Trivy JSON as artifact (for audit trail) ───────────────
+          # Expose critical/high counts as step output to fail the status check
+          CRITICAL=$(python3 -c "
+          import json, sys
+          r = json.load(open('trivy-report.json'))
+          total = sum(
+            1 for res in r.get('Results', [])
+            for v in (res.get('Vulnerabilities') or [])
+            if v.get('Severity','').upper() == 'CRITICAL'
+          )
+          print(total)
+          " 2>/dev/null || echo "0")
+
+          HIGH=$(python3 -c "
+          import json, sys
+          r = json.load(open('trivy-report.json'))
+          total = sum(
+            1 for res in r.get('Results', [])
+            for v in (res.get('Vulnerabilities') or [])
+            if v.get('Severity','').upper() == 'HIGH'
+          )
+          print(total)
+          " 2>/dev/null || echo "0")
+
+          echo "critical=$CRITICAL" >> $GITHUB_OUTPUT
+          echo "high=$HIGH"         >> $GITHUB_OUTPUT
+          echo "[INFO] CRITICAL=$CRITICAL HIGH=$HIGH"
+
+      # ── 4. Fail the status check if blocking vulns found ─────────────────
+      #    This is the SECOND merge gate: branch protection requires this
+      #    status check to pass. Even if review dismiss is bypassed,
+      #    the green checkmark won't appear until the scan is clean.
+      - name: Enforce merge gate on critical/high findings
+        if: >
+          steps.trivy_report.outputs.critical != '0' ||
+          steps.trivy_report.outputs.high != '0'
+        run: |
+          echo "::error::🚨 Merge blocked: CRITICAL=${{ steps.trivy_report.outputs.critical }} HIGH=${{ steps.trivy_report.outputs.high }}"
+          echo "Fix all CRITICAL and HIGH vulnerabilities before this PR can be merged."
+          exit 1
+
+      # ── 5. Upload JSON artifact ───────────────────────────────────────────
       - name: Upload Trivy report artifact
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trivy-report-${{ github.event.pull_request.number }}
+          name: trivy-report-pr-${{ github.event.pull_request.number }}
           path: trivy-report.json
           retention-days: 30

@@ -41,7 +41,7 @@ jobs:
       - name: Fetch Dependabot alerts and post resolvable thread
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DEPENDABOT_PAT: ${{ secrets.DEPENDABOT_PAT }}
+          DEPENDABOT_PAT: ${{ secrets.DEPENDABOT_PAT1 }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}

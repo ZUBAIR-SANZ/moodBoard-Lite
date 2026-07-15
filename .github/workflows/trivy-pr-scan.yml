@@ -1,52 +1,49 @@
-name: Trivy Vulnerability Scan on PR
+name: Dependabot Vulnerability Scan on PR
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+# If a newer commit lands on the same PR while a scan is running,
+# cancel the older run so you don't get two thread updates racing.
+concurrency:
+  group: dependabot-scan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
-  contents: read
-  pull-requests: write        # post comments + request changes
-  security-events: write      # upload SARIF (optional)
+  contents: read          # no branch push; checkout only
+  pull-requests: write    # post/update the resolvable review thread + resolve it
 
 jobs:
-  trivy-scan:
+  dependabot-scan:
+    # ⚠️ This job NAME is the required status check in branch protection
+    # ("Scan & Report Vulnerabilities"). Do NOT rename it.
+    #
+    # NOTE ON GATING: this check no longer fails on severity. The merge gate is
+    # now the resolvable thread + the "Require conversation resolution before
+    # merging" branch-protection setting. This check only goes red if the scan
+    # itself errors (missing PAT scope, Dependabot disabled, API failure) — a
+    # fail-closed backstop. Keep it required.
     name: Scan & Report Vulnerabilities
     runs-on: ubuntu-latest
-
     steps:
-      # ── 1. Checkout PR code ──────────────────────────────────────────────
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ── 2. Run Trivy fs scan → JSON output ──────────────────────────────
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@master
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          scan-type: "fs"
-          scan-ref: "."
-          format: "json"
-          output: "trivy-report.json"
-          severity: "CRITICAL,HIGH,MEDIUM,LOW"
-          exit-code: "0"          # don't fail the step; we handle logic in Python
+          python-version: '3.12'
 
-      # ── 3. Parse report + post PR comment ───────────────────────────────
-      - name: Parse Trivy report and post PR comment
+      - name: Install dependencies
+        run: pip install requests --quiet
+
+      - name: Fetch Dependabot alerts and post resolvable thread
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPENDABOT_PAT: ${{ secrets.DEPENDABOT_PAT1 }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          BOT_REVIEWER: ${{ github.actor }}   # used to avoid self-review error
-        run: |
-          pip install requests --quiet
-          python scripts/trivy_pr_comment.py
-
-      # ── 4. Upload Trivy JSON as artifact (for audit trail) ───────────────
-      - name: Upload Trivy report artifact
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: trivy-report-${{ github.event.pull_request.number }}
-          path: trivy-report.json
-          retention-days: 30
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: python scripts/trivy_pr_comment.py

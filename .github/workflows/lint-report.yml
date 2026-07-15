@@ -1,0 +1,54 @@
+name: Lint Report
+
+# Posts / updates a single "sticky" comment on the PR with a green tick in
+# front of each lint category. Runs on the current branch's PR.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write        # required for the default GITHUB_TOKEN to comment
+
+concurrency:
+  # cancel superseded runs on the same PR so only the latest comment sticks
+  group: lint-report-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint-report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------- JS / TS (ESLint) ----------
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Install node deps
+        run: npm ci
+      - name: Run ESLint (JSON)
+        # '|| true' so a non-zero lint exit still lets us parse + comment.
+        run: npx eslint . -f json -o eslint-report.json || true
+
+      # ---------- Python (Ruff) — drop this block if the repo has no Python ----------
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run Ruff (JSON)
+        run: |
+          pip install ruff
+          ruff check . --output-format json > ruff-report.json || true
+
+      # ---------- Post the categorized comment ----------
+      - name: Post lint report to PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python lint_report.py \
+            --eslint eslint-report.json \
+            --ruff ruff-report.json
+          # For a merge gate, add:  --fail-on errors
+          # To keep style out of the gate: --ruff-as-warnings

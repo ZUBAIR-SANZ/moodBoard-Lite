@@ -47,7 +47,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python lint_report.py \
+          python scripts/lint_report.py \
             --eslint eslint-report.json \
             --ruff ruff-report.json
           # For a merge gate, add:  --fail-on errors

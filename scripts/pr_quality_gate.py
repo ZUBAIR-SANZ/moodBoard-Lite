@@ -195,12 +195,77 @@ def section_build(changed):
         return {"status": f"⚠️ Build check errored: {e}", "ok": True,
                 "ran": False, "detail": ""}
 
-# ── 2) LINT (changed files only) ──────────────────────────────────────────────
+# ── 2) LINT (changed files only, categorized) ─────────────────────────────────
+
+# Three buckets, matching the standalone Lint Report. Edit the sets/prefixes
+# below to re-map any rule to a different category.
+LINT_CATS = ["Common programming mistakes",
+             "Code quality / maintainability",
+             "Style / consistency"]
+
+# ESLint core rules that are correctness ("Possible Problems").
+ESLINT_CORRECTNESS = {
+    "no-unused-vars", "no-undef", "no-const-assign", "no-dupe-keys", "no-dupe-args",
+    "no-dupe-class-members", "no-duplicate-case", "no-dupe-else-if", "no-unreachable",
+    "no-cond-assign", "no-debugger", "no-empty", "use-isnan", "valid-typeof",
+    "no-fallthrough", "no-obj-calls", "no-sparse-arrays", "no-redeclare",
+    "no-self-assign", "no-import-assign", "no-func-assign", "no-class-assign",
+    "no-setter-return", "no-unsafe-negation", "no-unsafe-optional-chaining",
+    "no-constant-condition", "no-control-regex", "no-invalid-regexp",
+    "no-irregular-whitespace", "no-misleading-character-class", "no-prototype-builtins",
+    "no-unexpected-multiline", "getter-return", "no-async-promise-executor",
+    "no-compare-neg-zero",
+}
+# ESLint core rules that are pure layout/formatting.
+ESLINT_STYLE = {
+    "semi", "quotes", "jsx-quotes", "indent", "comma-dangle", "comma-spacing",
+    "comma-style", "object-curly-spacing", "array-bracket-spacing", "space-before-blocks",
+    "space-before-function-paren", "space-in-parens", "space-infix-ops", "keyword-spacing",
+    "arrow-spacing", "key-spacing", "block-spacing", "func-call-spacing", "no-multi-spaces",
+    "no-multiple-empty-lines", "no-trailing-spaces", "eol-last", "brace-style", "max-len",
+    "padded-blocks", "spaced-comment", "quote-props", "semi-spacing", "no-tabs",
+    "no-mixed-spaces-and-tabs", "linebreak-style", "no-whitespace-before-property",
+    "dot-location", "operator-linebreak", "jsx-indent", "jsx-indent-props",
+    "multiline-ternary", "padding-line-between-statements",
+}
+
+def _cat_eslint(rule_id, fatal):
+    if fatal:
+        return LINT_CATS[0]
+    rid = rule_id or ""
+    if rid.startswith(("@stylistic/", "prettier/")):
+        return LINT_CATS[2]
+    base = rid.split("/")[-1]
+    if rid.startswith("react-hooks/") or base in ESLINT_CORRECTNESS:
+        return LINT_CATS[0]
+    if base in ESLINT_STYLE:
+        return LINT_CATS[2]
+    return LINT_CATS[1]
+
+def _cat_ruff(code):
+    c = (code or "").upper()
+    if c.startswith(("F", "E9", "PLE", "B", "S", "ASYNC", "T10")):   # bugs / likely errors
+        return LINT_CATS[0]
+    if c.startswith(("E", "W", "I", "D", "Q", "COM", "N", "ISC", "TID", "ERA", "EM")):
+        return LINT_CATS[2]                                          # style / imports / naming
+    return LINT_CATS[1]                                              # everything else = quality
 
 def section_lint(changed):
-    parts, details = [], []
+    cats = {c: {"errors": 0, "warnings": 0, "items": []} for c in LINT_CATS}
     errors = warnings = 0
     ran = False
+    notes = []
+
+    def add(cat, sev, file, line, code, message):
+        nonlocal errors, warnings
+        b = cats[cat]
+        if sev == "error":
+            b["errors"] += 1; errors += 1
+        else:
+            b["warnings"] += 1; warnings += 1
+        if len(b["items"]) < 50:
+            b["items"].append({"sev": sev, "file": file, "line": line,
+                               "code": code or "-", "message": message})
 
     # ESLint on changed JS/TS (uses the repo's own eslint from node_modules)
     if os.path.exists("package.json"):
@@ -215,21 +280,20 @@ def section_lint(changed):
                 results = None
             if results is not None:
                 ran = True
-                e = sum(r.get("errorCount", 0) for r in results)
-                w = sum(r.get("warningCount", 0) for r in results)
-                errors += e; warnings += w
-                parts.append(f"ESLint: **{e}** error(s), {w} warning(s)")
-                top = [f"`{r['filePath'].split('/')[-1]}` — "
-                       f"{r.get('errorCount',0)}E/{r.get('warningCount',0)}W"
-                       for r in results if r.get("errorCount") or r.get("warningCount")][:10]
-                if top:
-                    details.append("**ESLint (top files)**\n" + "\n".join(f"- {t}" for t in top))
+                for r in results:
+                    fname = (r.get("filePath") or "").split("/")[-1]
+                    for m in r.get("messages", []) or []:
+                        sev  = "error" if m.get("severity") == 2 else "warning"
+                        rid  = m.get("ruleId")
+                        cat  = _cat_eslint(rid, m.get("fatal"))
+                        add(cat, sev, fname, m.get("line", "?"), rid,
+                            (m.get("message") or "").strip())
             else:
-                parts.append("ESLint: not configured / skipped")
+                notes.append("ESLint not configured / skipped")
         else:
-            parts.append("ESLint: no changed JS/TS files")
+            notes.append("no changed JS/TS files")
 
-    # Ruff on changed Python (Ruff is fast even repo-wide, but scope it anyway)
+    # Ruff on changed Python
     if has_files("**/*.py"):
         targets = (["."] if changed is None
                    else [c for c in changed if c.endswith(".py") and os.path.exists(c)])
@@ -241,27 +305,19 @@ def section_lint(changed):
                 issues = None
             if issues is not None:
                 ran = True
-                errors += len(issues)
-                parts.append(f"Ruff: **{len(issues)}** issue(s)")
-                top = defaultdict(int)
                 for i in issues:
-                    top[i.get("code", "?")] += 1
-                if top:
-                    ranked = sorted(top.items(), key=lambda kv: -kv[1])[:10]
-                    details.append("**Ruff (top rules)**\n" +
-                                   "\n".join(f"- `{c}` × {n}" for c, n in ranked))
+                    code  = i.get("code") or ""
+                    fname = (i.get("filename") or "").split("/")[-1]
+                    line  = (i.get("location") or {}).get("row", "?")
+                    add(_cat_ruff(code), "error", fname, line, code,
+                        (i.get("message") or "").strip())
             else:
-                parts.append("Ruff: not runnable / skipped")
+                notes.append("Ruff not runnable / skipped")
         else:
-            parts.append("Ruff: no changed Python files")
+            notes.append("no changed Python files")
 
-    if not ran and not parts:
-        return {"status": "➖ No lint targets detected", "errors": 0,
-                "warnings": 0, "detail": "", "ran": False}
-
-    icon = "❌" if errors else ("⚠️" if warnings else "✅")
-    return {"status": f"{icon} " + " · ".join(parts), "errors": errors,
-            "warnings": warnings, "detail": "\n\n".join(details), "ran": ran}
+    return {"errors": errors, "warnings": warnings, "cats": cats,
+            "ran": ran, "notes": notes}
 
 # ── 3) VULNS (Trivy — runs first, lockfiles only, fail-closed) ────────────────
 
@@ -327,9 +383,44 @@ def build_body(build, lint, counts, top_alerts, blockers, noted):
                     f"{build['detail']}\n```\n</details>\n" if build.get("detail") else "")
     build_sec = f"### 🏗️ Build{_gate_tag(BLOCK_ON_BUILD)}\n{build['status']}\n{build_detail}"
 
-    lint_detail = (f"\n<details><summary>Lint details</summary>\n\n{lint['detail']}\n</details>\n"
-                   if lint.get("detail") else "")
-    lint_sec = f"### 🧹 Lint{_gate_tag(BLOCK_ON_LINT)}\n{lint['status']}\n{lint_detail}"
+    lc = lint["cats"]
+    any_findings = any(v["errors"] or v["warnings"] for v in lc.values())
+    if not any_findings:
+        extra = f" ({'; '.join(lint['notes'])})" if lint.get("notes") else ""
+        lint_body = f"✅ No lint issues{extra}"
+    else:
+        summary_lines = []
+        for cat in LINT_CATS:
+            e, w = lc[cat]["errors"], lc[cat]["warnings"]
+            if e == 0 and w == 0:
+                summary_lines.append(f"- ✅ **{cat}** — no issues")
+            elif w:
+                summary_lines.append(f"- ❌ **{cat}** — {e} error(s), {w} warning(s)")
+            else:
+                summary_lines.append(f"- ❌ **{cat}** — {e} error(s)")
+        summary = "\n".join(summary_lines)
+        total   = f"\n\n**Total:** {lint['errors']} error(s), {lint['warnings']} warning(s)"
+        notes   = f"\n\n_{'; '.join(lint['notes'])}_" if lint.get("notes") else ""
+        def _esc(s):
+            return str(s).replace("|", "\\|").replace("\n", " ").strip()
+        blocks = ""
+        for cat in LINT_CATS:
+            n = lc[cat]["errors"] + lc[cat]["warnings"]
+            if n:
+                rows = "\n".join(
+                    f"| {'🔴' if it['sev'] == 'error' else '🟡'} "
+                    f"| `{_esc(it['file'])}` | {_esc(it['line'])} "
+                    f"| `{_esc(it['code'])}` | {_esc(it['message'])} |"
+                    for it in lc[cat]["items"]
+                )
+                table = ("|  | File | Line | Rule | Message |\n"
+                         "|:-:|:-----|:----:|:-----|:--------|\n" + rows)
+                more = ("" if n <= len(lc[cat]["items"])
+                        else f"\n\n_…and {n - len(lc[cat]['items'])} more_")
+                blocks += (f"\n<details><summary>{cat} ({n})</summary>\n\n"
+                           f"{table}{more}\n\n</details>\n")
+        lint_body = f"{summary}{total}{notes}\n{blocks}"
+    lint_sec = f"### 🧹 Lint{_gate_tag(BLOCK_ON_LINT)}\n{lint_body}\n"
 
     total = sum(counts.get(s, 0) for s in SEVERITY_ORDER)
     rows = "".join(
@@ -456,7 +547,7 @@ def main():
     build = section_build(changed)
     print(f"[INFO] build={build['status']}")
     lint = section_lint(changed)
-    print(f"[INFO] lint={lint['status']}")
+    print(f"[INFO] lint errors={lint['errors']} warnings={lint['warnings']}")
 
     vuln_bad  = any(counts.get(s, 0) > 0 for s in BLOCK_ON)
     build_bad = not build["ok"]

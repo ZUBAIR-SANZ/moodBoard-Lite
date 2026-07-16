@@ -1,0 +1,78 @@
+name: PR Quality Gate
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+concurrency:
+  group: pr-quality-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+  pull-requests: write
+jobs:
+  quality-gate:
+    # ⚠️ Keep this job NAME as your required status check in branch protection.
+    name: Scan & Report Vulnerabilities
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout SOURCE branch (PR head)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compute cache keys
+        id: keys
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      # Cache package-manager DOWNLOAD caches so installs run mostly offline.
+      # Keyed on lockfile hashes; falls back to the newest partial cache.
+      - name: Cache package-manager downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.cache/yarn
+            ~/.local/share/pnpm/store
+          key: pm-${{ runner.os }}-${{ hashFiles('**/package-lock.json', '**/yarn.lock', '**/pnpm-lock.yaml') }}
+          restore-keys: |
+            pm-${{ runner.os }}-
+
+      # Cache Trivy's vuln DB. Daily key = at most one DB download per day,
+      # while restore-keys reuses yesterday's DB on the first run of the day.
+      - name: Cache Trivy DB
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: trivy-db-${{ runner.os }}-${{ steps.keys.outputs.day }}
+          restore-keys: |
+            trivy-db-${{ runner.os }}-
+
+      - name: Install tooling (requests, ruff, Trivy)
+        run: |
+          pip install requests ruff --quiet
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin
+          trivy --version
+
+      - name: Run PR quality gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          SCAN_PATH: '.'
+          # ── Gating knobs — all three block the merge ──────────────────
+          BLOCK_ON_VULN: 'true'
+          BLOCK_ON_BUILD: 'true'
+          BLOCK_ON_LINT: 'true'
+        run: python scripts/pr_quality_gate.py

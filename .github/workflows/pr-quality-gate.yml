@@ -11,7 +11,7 @@ permissions:
 jobs:
   quality-gate:
     # ⚠️ Keep this job NAME as your required status check in branch protection.
-    name: Scan & Report Vulnerabilities
+    name: PR Quality Gate
     runs-on: ubuntu-latest
     steps:
       - name: Checkout SOURCE branch (PR head)
